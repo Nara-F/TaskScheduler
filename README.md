@@ -22,8 +22,6 @@ task_scheduler::BlockingThreadPoolScheduler automatic;  // 默认：硬件线程
 task_scheduler::BlockingThreadPoolScheduler fixed(4);   // 显式：4 个工作线程
 ```
 
-`spawn` 每批最多创建 `min(num_total_tasks, num_threads)` 个工作线程；两个线程池按选定数量创建工作线程，调用线程不参与任务计算。串行调度器始终在调用线程执行。测试脚本的 `--threads` 默认值仍为 4。
-
 ## 构建
 
 需要支持 C++11 的编译器、CMake 3.16 或更新版本，以及系统线程库。构建测试还需要 Python 3.8 或更新版本。
