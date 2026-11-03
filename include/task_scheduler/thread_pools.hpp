@@ -11,56 +11,78 @@
 
 namespace task_scheduler {
 
-class SequentialScheduler : public Scheduler {
+class SequentialScheduler final : public Scheduler {
    public:
-    SequentialScheduler(int num_threads = defaultThreadCount());
-    ~SequentialScheduler();
-    const char* name();
-    void execute(Task* work, int num_total_tasks);
+    explicit SequentialScheduler(int num_threads = defaultThreadCount());
+    ~SequentialScheduler() override = default;
+    const char* name() const noexcept override;
+    void execute(Task* work, int num_total_tasks) override;
     TaskId submit(Task* work, int num_total_tasks,
-                  const std::vector<TaskId>& deps);
-    void waitForAll();
+                  const std::vector<TaskId>& deps) override;
+    void waitForAll() override;
 };
 
-class SpawnPerCallScheduler : public Scheduler {
+class SpawnPerCallScheduler final : public Scheduler {
    public:
-    int num_threads;
+    explicit SpawnPerCallScheduler(int num_threads = defaultThreadCount());
+    ~SpawnPerCallScheduler() override = default;
+    const char* name() const noexcept override;
+    void execute(Task* work, int num_total_tasks) override;
+    TaskId submit(Task* work, int num_total_tasks,
+                  const std::vector<TaskId>& deps) override;
+    void waitForAll() override;
+
+   private:
+    void workerLoop(Task* work, int num_total_tasks);
+
+    const int num_threads;
     std::mutex task_id_mutex;
-    TaskId curTask;
-    SpawnPerCallScheduler(int num_threads = defaultThreadCount());
-    ~SpawnPerCallScheduler();
-    const char* name();
-    void execute(Task* work, int num_total_tasks);
-    TaskId submit(Task* work, int num_total_tasks,
-                  const std::vector<TaskId>& deps);
-    void waitForAll();
+    TaskId curTask = 0;
 };
 
-class BusyWaitThreadPoolScheduler : public Scheduler {
+class BusyWaitThreadPoolScheduler final : public Scheduler {
    public:
-    BusyWaitThreadPoolScheduler(int num_threads = defaultThreadCount());
-    ~BusyWaitThreadPoolScheduler();
+    explicit BusyWaitThreadPoolScheduler(int num_threads = defaultThreadCount());
+    ~BusyWaitThreadPoolScheduler() override;
+    const char* name() const noexcept override;
+    void execute(Task* work, int num_total_tasks) override;
+    TaskId submit(Task* work, int num_total_tasks,
+                  const std::vector<TaskId>& deps) override;
+    void waitForAll() override;
+
+   private:
+    void workerLoop(int worker_index);
+    void stopWorkers();
+
     std::vector<std::mutex> work_queues_mutexs;
     std::mutex task_id_mutex;
     std::mutex finish_mutex;
     int finish_count = 0;
-    TaskId curTask;
+    TaskId curTask = 0;
     struct WorkItem {
         Task* work;
         int num_total_tasks;
     };
-    int num_threads;
-    std::vector<std::thread> threads;
+    const int num_threads;
+    std::vector<std::thread> threads_;
     std::vector<WorkItem> work_queues;
-    const char* name();
-    void execute(Task* work, int num_total_tasks);
-    TaskId submit(Task* work, int num_total_tasks,
-                  const std::vector<TaskId>& deps);
-    void waitForAll();
+
+   public:
+    // Read-only compatibility view for worker inspection.
+    const std::vector<std::thread>& threads = threads_;
 };
 
-class BlockingThreadPoolScheduler : public Scheduler {
+class BlockingThreadPoolScheduler final : public Scheduler {
    public:
+    explicit BlockingThreadPoolScheduler(int num_threads = defaultThreadCount());
+    ~BlockingThreadPoolScheduler() override;
+    const char* name() const noexcept override;
+    void execute(Task* work, int num_total_tasks) override;
+    TaskId submit(Task* work, int num_total_tasks,
+                  const std::vector<TaskId>& deps) override;
+    void waitForAll() override;
+
+   private:
     struct WorkItem {
         Task* work;
         int task_idx;
@@ -74,13 +96,18 @@ class BlockingThreadPoolScheduler : public Scheduler {
         TaskId task_id;
     };
 
-    int num_threads;
-    TaskId curTask;
+    bool enqueueIfReady(const PendingTask& task);
+    void workerLoop(int worker_index);
+    void stopWorkers();
+    void waitUntilIdle();
+
+    const int num_threads;
+    TaskId curTask = 0;
     std::mutex task_mutex;
     std::vector<int> task_remaining;
     std::deque<WorkItem> task_queue;
     std::mutex queue_mutex;
-    std::vector<std::thread> threads;
+    std::vector<std::thread> threads_;
 
     std::mutex set_mutex;
     std::unordered_set<TaskId> finished_tasks;
@@ -99,14 +126,9 @@ class BlockingThreadPoolScheduler : public Scheduler {
 
     std::vector<std::condition_variable> cv;
 
-    BlockingThreadPoolScheduler(int num_threads = defaultThreadCount());
-    ~BlockingThreadPoolScheduler();
-    const char* name();
-    bool enqueueIfReady(PendingTask& task);
-    void execute(Task* work, int num_total_tasks);
-    TaskId submit(Task* work, int num_total_tasks,
-                  const std::vector<TaskId>& deps);
-    void waitForAll();
+   public:
+    // Read-only compatibility view for worker inspection.
+    const std::vector<std::thread>& threads = threads_;
 };
 
 }  // namespace task_scheduler
