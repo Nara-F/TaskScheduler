@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -38,6 +40,7 @@ class SpawnPerCallScheduler final : public Scheduler {
     const int num_threads;
     std::mutex task_id_mutex;
     TaskId curTask = 0;
+    std::exception_ptr task_exception;
 };
 
 class BusyWaitThreadPoolScheduler final : public Scheduler {
@@ -58,6 +61,7 @@ class BusyWaitThreadPoolScheduler final : public Scheduler {
     std::mutex task_id_mutex;
     std::mutex finish_mutex;
     int finish_count = 0;
+    std::exception_ptr task_exception;
     TaskId curTask = 0;
     struct WorkItem {
         Task* work;
@@ -87,13 +91,17 @@ class BlockingThreadPoolScheduler final : public Scheduler {
         Task* work;
         int task_idx;
         int num_total_tasks;
-        int task_id;
+        TaskId task_id;
     };
     struct PendingTask {
         Task* work;
         int num_total_tasks;
         std::vector<TaskId> deps;
         TaskId task_id;
+    };
+    struct BatchState {
+        int remaining;
+        std::exception_ptr error;
     };
 
     bool enqueueIfReady(const PendingTask& task);
@@ -104,7 +112,7 @@ class BlockingThreadPoolScheduler final : public Scheduler {
     const int num_threads;
     TaskId curTask = 0;
     std::mutex task_mutex;
-    std::vector<int> task_remaining;
+    std::vector<BatchState> task_states;
     std::deque<WorkItem> task_queue;
     std::mutex queue_mutex;
     std::vector<std::thread> threads_;
@@ -116,7 +124,8 @@ class BlockingThreadPoolScheduler final : public Scheduler {
     std::vector<PendingTask> pending_tasks;
 
     // Empty batches count as one until their dependencies complete.
-    int pending_task_count = 0;
+    std::size_t pending_task_count = 0;
+    std::exception_ptr task_exception;
     std::mutex finished_task_mutex;
     std::condition_variable finished_task_cv;
 

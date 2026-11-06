@@ -14,6 +14,8 @@ class Task {
     virtual void executeTask(int task_id, int num_total_tasks) = 0;
 };
 
+// Calls on a scheduler require external serialization. Task callbacks must not
+// wait on or destroy the scheduler executing them.
 class Scheduler {
    public:
     // Hardware concurrency minus one, with a minimum of one worker.
@@ -38,7 +40,7 @@ class Scheduler {
     virtual TaskId submit(Task* work, int num_total_tasks,
                           const std::vector<TaskId>& deps) = 0;
 
-    // Wait for all previously submitted work to complete.
+    // Wait for all previously submitted work to complete and report task errors.
     virtual void waitForAll() = 0;
 
    protected:

@@ -1,10 +1,28 @@
 #include "task_scheduler/thread_pools.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 namespace task_scheduler {
 
 namespace {
+
+int checkedThreadCount(int num_threads) {
+    if (num_threads < 1) {
+        throw std::invalid_argument("worker thread count must be positive");
+    }
+    return num_threads;
+}
+
+void validateTask(Task* work, int num_total_tasks) {
+    if (num_total_tasks < 0) {
+        throw std::invalid_argument("task count must not be negative");
+    }
+    if (num_total_tasks > 0 && work == nullptr) {
+        throw std::invalid_argument("nonempty batches require a task");
+    }
+}
 
 void joinThreads(std::vector<std::thread>& threads) {
     for (auto& thread : threads) {
@@ -31,20 +49,23 @@ int Scheduler::defaultThreadCount() {
     return hardware_threads > 1 ? static_cast<int>(hardware_threads - 1) : 1;
 }
 
-const char* SequentialScheduler::name() const noexcept { return "SequentialScheduler"; }
+const char* SequentialScheduler::name() const noexcept {
+    return "SequentialScheduler";
+}
 
-SequentialScheduler::SequentialScheduler(int) {}
+SequentialScheduler::SequentialScheduler(int num_threads) {
+    checkedThreadCount(num_threads);
+}
 
 void SequentialScheduler::execute(Task* work, int num_total_tasks) {
+    validateTask(work, num_total_tasks);
     for (int i = 0; i < num_total_tasks; i++) {
         work->executeTask(i, num_total_tasks);
     }
 }
 
-TaskId SequentialScheduler::submit(Task* work,
-    int num_total_tasks,
-    const std::vector<TaskId>& deps) {
-    return 0;
+TaskId SequentialScheduler::submit(Task*, int, const std::vector<TaskId>&) {
+    throw std::logic_error("SequentialScheduler does not support asynchronous submission");
 }
 
 void SequentialScheduler::waitForAll() { return; }
@@ -54,19 +75,24 @@ const char* SpawnPerCallScheduler::name() const noexcept {
 }
 
 SpawnPerCallScheduler::SpawnPerCallScheduler(int num_threads)
-    : num_threads(num_threads) {}
+    : num_threads(checkedThreadCount(num_threads)) {}
 
 void SpawnPerCallScheduler::execute(Task* work, int num_total_tasks) {
+    validateTask(work, num_total_tasks);
     const int maxThread = std::min(num_total_tasks, num_threads);
     std::vector<std::thread> threads;
     threads.reserve(maxThread);
-    ThreadJoiner joiner(threads);
 
     curTask = 0;
-    for (int i = 0; i < maxThread; i++) {
-        threads.emplace_back(&SpawnPerCallScheduler::workerLoop, this,
-                             work, num_total_tasks);
+    task_exception = nullptr;
+    {
+        ThreadJoiner joiner(threads);
+        for (int i = 0; i < maxThread; i++) {
+            threads.emplace_back(&SpawnPerCallScheduler::workerLoop, this,
+                                 work, num_total_tasks);
+        }
     }
+    if (task_exception) std::rethrow_exception(task_exception);
 }
 
 void SpawnPerCallScheduler::workerLoop(Task* work, int num_total_tasks) {
@@ -74,16 +100,21 @@ void SpawnPerCallScheduler::workerLoop(Task* work, int num_total_tasks) {
         TaskId task_id;
         {
             std::lock_guard<std::mutex> lock(task_id_mutex);
+            if (curTask >= num_total_tasks) return;
             task_id = curTask++;
         }
-        if (task_id >= num_total_tasks) return;
-        work->executeTask(task_id, num_total_tasks);
+        try {
+            work->executeTask(task_id, num_total_tasks);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(task_id_mutex);
+            if (!task_exception) task_exception = std::current_exception();
+        }
     }
 }
 
 TaskId SpawnPerCallScheduler::submit(
-    Task* work, int num_total_tasks, const std::vector<TaskId>& deps) {
-    return 0;
+    Task*, int, const std::vector<TaskId>&) {
+    throw std::logic_error("SpawnPerCallScheduler does not support asynchronous submission");
 }
 
 void SpawnPerCallScheduler::waitForAll() { return; }
@@ -94,8 +125,8 @@ const char* BusyWaitThreadPoolScheduler::name() const noexcept {
 
 BusyWaitThreadPoolScheduler::BusyWaitThreadPoolScheduler(
     int num_threads)
-    : work_queues_mutexs(std::max(1, num_threads)),
-      num_threads(std::max(1, num_threads)),
+    : work_queues_mutexs(checkedThreadCount(num_threads)),
+      num_threads(num_threads),
       threads_(this->num_threads),
       work_queues(this->num_threads) {
     try {
@@ -123,11 +154,15 @@ void BusyWaitThreadPoolScheduler::workerLoop(int idx) {
         do {
             {
                 std::lock_guard<std::mutex> lock(task_id_mutex);
-                task_id = curTask;
-                curTask++;
+                if (curTask >= task.num_total_tasks) break;
+                task_id = curTask++;
             }
-            if (task_id >= task.num_total_tasks) break;
-            task.work->executeTask(task_id, task.num_total_tasks);
+            try {
+                task.work->executeTask(task_id, task.num_total_tasks);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(finish_mutex);
+                if (!task_exception) task_exception = std::current_exception();
+            }
         } while (true);
 
         {
@@ -158,6 +193,7 @@ void BusyWaitThreadPoolScheduler::stopWorkers() {
 
 void BusyWaitThreadPoolScheduler::execute(Task* work,
     int num_total_tasks) {
+    validateTask(work, num_total_tasks);
     int maxThread = std::min(num_total_tasks, num_threads);
     {
         std::lock_guard<std::mutex> lock(task_id_mutex);
@@ -166,6 +202,7 @@ void BusyWaitThreadPoolScheduler::execute(Task* work,
     {
         std::lock_guard<std::mutex> lock(finish_mutex);
         finish_count = 0;
+        task_exception = nullptr;
     }
     {
         for (int i = 0; i < maxThread; i++) {
@@ -175,21 +212,24 @@ void BusyWaitThreadPoolScheduler::execute(Task* work,
             }
         }
     }
+    std::exception_ptr error;
     while (true) {
         {
             std::lock_guard<std::mutex> lock(finish_mutex);
             if (finish_count >= maxThread) {
+                error = task_exception;
                 break;
             }
         }
     }
+    if (error) std::rethrow_exception(error);
 }
 
 void BusyWaitThreadPoolScheduler::waitForAll() { return; }
 
 TaskId BusyWaitThreadPoolScheduler::submit(
-    Task* work, int num_total_tasks, const std::vector<TaskId>& deps) {
-    return 0;
+    Task*, int, const std::vector<TaskId>&) {
+    throw std::logic_error("BusyWaitThreadPoolScheduler does not support asynchronous submission");
 }
 
 const char* BlockingThreadPoolScheduler::name() const noexcept {
@@ -198,11 +238,11 @@ const char* BlockingThreadPoolScheduler::name() const noexcept {
 
 BlockingThreadPoolScheduler::BlockingThreadPoolScheduler(
     int num_threads)
-    : num_threads(std::max(num_threads, 1)),
+    : num_threads(checkedThreadCount(num_threads)),
       threads_(this->num_threads),
       status_call(this->num_threads, 0),
-      status_mutex(std::max(num_threads, 1)),
-      cv(std::max(num_threads, 1)) {
+      status_mutex(this->num_threads),
+      cv(this->num_threads) {
     try {
         for (int i = 0; i < this->num_threads; i++) {
             threads_[i] = std::thread(&BlockingThreadPoolScheduler::workerLoop,
@@ -246,11 +286,25 @@ void BlockingThreadPoolScheduler::workerLoop(int idx) {
                         break;
                     }
                 }
-                task.work->executeTask(task.task_idx, task.num_total_tasks);
+                try {
+                    task.work->executeTask(task.task_idx, task.num_total_tasks);
+                } catch (...) {
+                    const auto error = std::current_exception();
+                    {
+                        std::lock_guard<std::mutex> lock(task_mutex);
+                        if (!task_states[task.task_id].error) {
+                            task_states[task.task_id].error = error;
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(finished_task_mutex);
+                        if (!task_exception) task_exception = error;
+                    }
+                }
                 bool batch_finished;
                 {
                     std::lock_guard<std::mutex> lock(task_mutex);
-                    batch_finished = --task_remaining[task.task_id] == 0;
+                    batch_finished = --task_states[task.task_id].remaining == 0;
                 }
                 if (batch_finished) {
                     {
@@ -309,22 +363,47 @@ bool BlockingThreadPoolScheduler::enqueueIfReady(const PendingTask& task) {
         }
     }
     if (deps_completed) {
-        if (num_total_tasks == 0) {
+        std::exception_ptr error;
+        {
+            std::lock_guard<std::mutex> lock(task_mutex);
+            for (TaskId dep : deps) {
+                if (task_states[dep].error) {
+                    error = task_states[dep].error;
+                    break;
+                }
+            }
+            if (error) {
+                task_states[task_id].error = error;
+                task_states[task_id].remaining = 0;
+            }
+        }
+        // Failed prerequisites complete the batch without invoking its callback.
+        if (num_total_tasks == 0 || error) {
             {
                 std::lock_guard<std::mutex> lock(set_mutex);
                 finished_tasks.insert(task_id);
             }
             {
                 std::lock_guard<std::mutex> lock(finished_task_mutex);
-                if (--pending_task_count == 0) {
+                if (error && !task_exception) task_exception = error;
+                pending_task_count -= num_total_tasks == 0 ? 1 : num_total_tasks;
+                if (pending_task_count == 0) {
                     finished_task_cv.notify_all();
                 }
             }
             return true;
         }
-        for (int i = 0; i < num_total_tasks; i++) {
+        {
             std::lock_guard<std::mutex> lock(queue_mutex);
-            task_queue.push_back(WorkItem{work, i, num_total_tasks, task_id});
+            const auto previous_size = task_queue.size();
+            try {
+                for (int i = 0; i < num_total_tasks; i++) {
+                    task_queue.push_back(WorkItem{work, i, num_total_tasks, task_id});
+                }
+            } catch (...) {
+                while (task_queue.size() > previous_size) task_queue.pop_back();
+                throw;
+            }
         }
         for (int i = 0; i < num_threads; i++) {
             std::unique_lock<std::mutex> lock(status_mutex[i]);
@@ -335,6 +414,7 @@ bool BlockingThreadPoolScheduler::enqueueIfReady(const PendingTask& task) {
     }
     return false;
 }
+
 void BlockingThreadPoolScheduler::execute(Task* work,
     int num_total_tasks) {
     submit(work, num_total_tasks, {});
@@ -343,22 +423,45 @@ void BlockingThreadPoolScheduler::execute(Task* work,
 
 TaskId BlockingThreadPoolScheduler::submit(
     Task* work, int num_total_tasks, const std::vector<TaskId>& deps) {
+    validateTask(work, num_total_tasks);
+    PendingTask task{work, num_total_tasks, deps, 0};
+    std::unique_lock<std::mutex> pending_lock(pending_set_mutex);
 
     TaskId task_id;
     {
         std::lock_guard<std::mutex> lock(task_mutex);
-        task_id = curTask++;
-        task_remaining.push_back(num_total_tasks);
+        for (TaskId dep : deps) {
+            if (dep < 0 || dep >= curTask) {
+                throw std::invalid_argument("dependencies must name previously submitted batches");
+            }
+        }
+        if (curTask == std::numeric_limits<TaskId>::max()) {
+            throw std::overflow_error("task ID space exhausted");
+        }
+        task_id = curTask;
+        task_states.push_back(BatchState{num_total_tasks, std::exception_ptr()});
+        ++curTask;
     }
 
     {
         std::lock_guard<std::mutex> lock(finished_task_mutex);
         pending_task_count += num_total_tasks == 0 ? 1 : num_total_tasks;
     }
-    std::unique_lock<std::mutex> lockP(pending_set_mutex);
-    PendingTask task{work, num_total_tasks, deps, task_id};
-    if (!enqueueIfReady(task)) {
-        pending_tasks.push_back(task);
+    task.task_id = task_id;
+    try {
+        if (!enqueueIfReady(task)) pending_tasks.push_back(task);
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(task_mutex);
+            task_states.pop_back();
+            --curTask;
+        }
+        {
+            std::lock_guard<std::mutex> lock(finished_task_mutex);
+            pending_task_count -= num_total_tasks == 0 ? 1 : num_total_tasks;
+            if (pending_task_count == 0) finished_task_cv.notify_all();
+        }
+        throw;
     }
 
     return task_id;
@@ -366,12 +469,18 @@ TaskId BlockingThreadPoolScheduler::submit(
 
 void BlockingThreadPoolScheduler::waitForAll() {
     waitUntilIdle();
+    std::exception_ptr error;
+    {
+        std::lock_guard<std::mutex> lock(finished_task_mutex);
+        error = task_exception;
+        task_exception = nullptr;
+    }
+    if (error) std::rethrow_exception(error);
 }
 
 void BlockingThreadPoolScheduler::waitUntilIdle() {
     std::unique_lock<std::mutex> lock(finished_task_mutex);
     finished_task_cv.wait(lock, [&] { return pending_task_count == 0; });
-    return;
 }
 
 }  // namespace task_scheduler
