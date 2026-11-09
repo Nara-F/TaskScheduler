@@ -239,14 +239,11 @@ const char* BlockingThreadPoolScheduler::name() const noexcept {
 BlockingThreadPoolScheduler::BlockingThreadPoolScheduler(
     int num_threads)
     : num_threads(checkedThreadCount(num_threads)),
-      threads_(this->num_threads),
-      status_call(this->num_threads, 0),
-      status_mutex(this->num_threads),
-      cv(this->num_threads) {
+      threads_(this->num_threads) {
     try {
         for (int i = 0; i < this->num_threads; i++) {
             threads_[i] = std::thread(&BlockingThreadPoolScheduler::workerLoop,
-                                      this, i);
+                                      this);
         }
     } catch (...) {
         stopWorkers();
@@ -254,83 +251,56 @@ BlockingThreadPoolScheduler::BlockingThreadPoolScheduler(
     }
 }
 
-void BlockingThreadPoolScheduler::workerLoop(int idx) {
+void BlockingThreadPoolScheduler::workerLoop() {
     while (true) {
-        std::unique_lock<std::mutex> lock(status_mutex[idx]);
-        cv[idx].wait(lock, [&] {
-            return status_call[idx] == 1 || status_call[idx] == -1;
-        });
-        auto sta = status_call[idx];
-        lock.unlock();
-        if (sta == 1) {
-            WorkItem task;
-            do {
-                {
-                    std::lock_guard<std::mutex> lock(queue_mutex);
-                    if (!task_queue.empty()) {
-                        task = task_queue.front();
-                        task_queue.pop_front();
-                    } else {
-                        {
-                            std::lock_guard<std::mutex> lock(
-                                status_mutex[idx]);
-                            if (status_call[idx] == 1) status_call[idx] = 0;
-                        }
-                        {
-                            std::lock_guard<std::mutex> lock(
-                                finished_task_mutex);
-                            if (pending_task_count == 0) {
-                                finished_task_cv.notify_all();
-                            }
-                        }
-                        break;
-                    }
+        WorkItem task;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            ++idle_workers;
+            work_cv.wait(lock, [this] { return stopping || !task_queue.empty(); });
+            --idle_workers;
+            if (stopping && task_queue.empty()) return;
+            task = task_queue.front();
+            task_queue.pop_front();
+        }
+        try {
+            task.work->executeTask(task.task_idx, task.num_total_tasks);
+        } catch (...) {
+            const auto error = std::current_exception();
+            {
+                std::lock_guard<std::mutex> lock(task_mutex);
+                if (!task_states[task.task_id].error) {
+                    task_states[task.task_id].error = error;
                 }
-                try {
-                    task.work->executeTask(task.task_idx, task.num_total_tasks);
-                } catch (...) {
-                    const auto error = std::current_exception();
-                    {
-                        std::lock_guard<std::mutex> lock(task_mutex);
-                        if (!task_states[task.task_id].error) {
-                            task_states[task.task_id].error = error;
-                        }
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(finished_task_mutex);
-                        if (!task_exception) task_exception = error;
-                    }
+            }
+            {
+                std::lock_guard<std::mutex> lock(finished_task_mutex);
+                if (!task_exception) task_exception = error;
+            }
+        }
+        bool batch_finished;
+        {
+            std::lock_guard<std::mutex> lock(task_mutex);
+            batch_finished = --task_states[task.task_id].remaining == 0;
+        }
+        if (batch_finished) {
+            {
+                std::lock_guard<std::mutex> lock(set_mutex);
+                finished_tasks.insert(task.task_id);
+            }
+            {
+                std::lock_guard<std::mutex> lock(pending_set_mutex);
+                for (auto it = pending_tasks.begin(); it != pending_tasks.end();) {
+                    if (enqueueIfReady(*it))
+                        it = pending_tasks.erase(it);
+                    else
+                        ++it;
                 }
-                bool batch_finished;
-                {
-                    std::lock_guard<std::mutex> lock(task_mutex);
-                    batch_finished = --task_states[task.task_id].remaining == 0;
-                }
-                if (batch_finished) {
-                    {
-                        std::lock_guard<std::mutex> lock(set_mutex);
-                        finished_tasks.insert(task.task_id);
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(pending_set_mutex);
-                        for (auto it = pending_tasks.begin();
-                             it != pending_tasks.end();) {
-                            if (enqueueIfReady(*it))
-                                it = pending_tasks.erase(it);
-                            else
-                                ++it;
-                        }
-                    }
-                }
-                {
-                    std::lock_guard<std::mutex> lock(finished_task_mutex);
-                    if (--pending_task_count == 0) {
-                        finished_task_cv.notify_all();
-                    }
-                }
-            } while (true);
-        } else if (sta == -1) {
-            break;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(finished_task_mutex);
+            if (--pending_task_count == 0) finished_task_cv.notify_all();
         }
     }
 }
@@ -341,11 +311,11 @@ BlockingThreadPoolScheduler::~BlockingThreadPoolScheduler() {
 }
 
 void BlockingThreadPoolScheduler::stopWorkers() {
-    for (int i = 0; i < num_threads; i++) {
-        std::unique_lock<std::mutex> lock(status_mutex[i]);
-        status_call[i] = -1;
-        cv[i].notify_all();
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        stopping = true;
     }
+    work_cv.notify_all();
     joinThreads(threads_);
 }
 
@@ -393,6 +363,7 @@ bool BlockingThreadPoolScheduler::enqueueIfReady(const PendingTask& task) {
             }
             return true;
         }
+        std::size_t wake_count;
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
             const auto previous_size = task_queue.size();
@@ -404,12 +375,10 @@ bool BlockingThreadPoolScheduler::enqueueIfReady(const PendingTask& task) {
                 while (task_queue.size() > previous_size) task_queue.pop_back();
                 throw;
             }
+            wake_count = std::min(idle_workers,
+                                  static_cast<std::size_t>(num_total_tasks));
         }
-        for (int i = 0; i < num_threads; i++) {
-            std::unique_lock<std::mutex> lock(status_mutex[i]);
-            status_call[i] = 1;
-            cv[i].notify_all();
-        }
+        for (std::size_t i = 0; i < wake_count; ++i) work_cv.notify_one();
         return true;
     }
     return false;

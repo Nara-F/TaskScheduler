@@ -105,7 +105,7 @@ class BlockingThreadPoolScheduler final : public Scheduler {
     };
 
     bool enqueueIfReady(const PendingTask& task);
-    void workerLoop(int worker_index);
+    void workerLoop();
     void stopWorkers();
     void waitUntilIdle();
 
@@ -115,6 +115,9 @@ class BlockingThreadPoolScheduler final : public Scheduler {
     std::vector<BatchState> task_states;
     std::deque<WorkItem> task_queue;
     std::mutex queue_mutex;
+    std::condition_variable work_cv;
+    std::size_t idle_workers = 0;
+    bool stopping = false;
     std::vector<std::thread> threads_;
 
     std::mutex set_mutex;
@@ -128,12 +131,6 @@ class BlockingThreadPoolScheduler final : public Scheduler {
     std::exception_ptr task_exception;
     std::mutex finished_task_mutex;
     std::condition_variable finished_task_cv;
-
-    // Worker states: -1 = stop, 0 = idle, 1 = running.
-    std::vector<int> status_call;
-    std::vector<std::mutex> status_mutex;
-
-    std::vector<std::condition_variable> cv;
 
    public:
     // Read-only compatibility view for worker inspection.
