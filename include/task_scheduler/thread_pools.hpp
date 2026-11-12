@@ -6,7 +6,6 @@
 #include <exception>
 #include <mutex>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #include "task_scheduler/scheduler.hpp"
@@ -93,18 +92,24 @@ class BlockingThreadPoolScheduler final : public Scheduler {
         int num_total_tasks;
         TaskId task_id;
     };
-    struct PendingTask {
+    struct BatchState {
         Task* work;
         int num_total_tasks;
-        std::vector<TaskId> deps;
-        TaskId task_id;
-    };
-    struct BatchState {
         int remaining;
+        std::size_t unresolved_dependencies = 0;
+        bool complete = false;
+        TaskId next_completed = -1;
+        std::vector<TaskId> successors;
         std::exception_ptr error;
+
+        BatchState(Task* task, int count)
+            : work(task), num_total_tasks(count), remaining(count) {}
     };
 
-    bool enqueueIfReady(const PendingTask& task);
+    // Dependency and queue updates require task_mutex to be held.
+    void enqueueBatch(TaskId task_id);
+    void completeBatch(TaskId task_id);
+    void notifyWorkers(std::size_t count);
     void workerLoop();
     void stopWorkers();
     void waitUntilIdle();
@@ -114,22 +119,14 @@ class BlockingThreadPoolScheduler final : public Scheduler {
     std::mutex task_mutex;
     std::vector<BatchState> task_states;
     std::deque<WorkItem> task_queue;
-    std::mutex queue_mutex;
     std::condition_variable work_cv;
     std::size_t idle_workers = 0;
     bool stopping = false;
     std::vector<std::thread> threads_;
 
-    std::mutex set_mutex;
-    std::unordered_set<TaskId> finished_tasks;
-
-    std::mutex pending_set_mutex;
-    std::vector<PendingTask> pending_tasks;
-
-    // Empty batches count as one until their dependencies complete.
-    std::size_t pending_task_count = 0;
+    // Every accepted batch remains pending until its dependencies and tasks finish.
+    std::size_t pending_batch_count = 0;
     std::exception_ptr task_exception;
-    std::mutex finished_task_mutex;
     std::condition_variable finished_task_cv;
 
    public:
