@@ -6,6 +6,7 @@
 #include <exception>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "task_scheduler/scheduler.hpp"
@@ -85,6 +86,10 @@ class BlockingThreadPoolScheduler final : public Scheduler {
                   const std::vector<TaskId>& deps) override;
     void waitForAll() override;
 
+    // Wait for completion, then release retained state and invalidate all old IDs.
+    // Unreported task errors are thrown before any history is released.
+    void releaseHistory();
+
    private:
     struct WorkItem {
         Task* work;
@@ -116,8 +121,10 @@ class BlockingThreadPoolScheduler final : public Scheduler {
 
     const int num_threads;
     TaskId curTask = 0;
+    TaskId first_valid_task_id = 0;
     std::mutex task_mutex;
-    std::vector<BatchState> task_states;
+    // Missing valid IDs denote successful batches whose state has been reclaimed.
+    std::unordered_map<TaskId, BatchState> task_states;
     std::deque<WorkItem> task_queue;
     std::condition_variable work_cv;
     std::size_t idle_workers = 0;
